@@ -8,8 +8,8 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="Wetter">
 <meta name="theme-color" content="#0b1220">
-<link rel="apple-touch-icon" href="icon.png">
-<link rel="icon" type="image/png" href="icon.png">
+<link rel="apple-touch-icon" href="icon.png?v=2">
+<link rel="icon" type="image/png" href="icon.png?v=2">
 <title>Wetter</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <style>
@@ -75,6 +75,19 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:poin
 .day .hi{font-weight:600}
 .range{height:5px;border-radius:3px;background:var(--line);position:relative}
 .range i{position:absolute;top:0;bottom:0;border-radius:3px;background:linear-gradient(90deg,#60a5fa,#facc15)}
+.warn{border-left:4px solid var(--wc);background:var(--chip);border-radius:12px;padding:10px 12px;margin-top:8px}
+.warn:first-child{margin-top:0}
+.warn b{display:block;font-size:15px}
+.warn small{display:block;color:var(--muted);font-size:12px;margin-top:2px}
+.warn p{margin:6px 0 0;font-size:14px}
+.okline{font-size:15px}
+.aq{display:flex;align-items:center;gap:10px;margin-bottom:10px}
+.aq b{font-size:30px;font-weight:600}
+.lvl{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;color:#111827;background:var(--line)}
+.lvl.none{background:var(--chip);color:var(--muted)}
+.stats.three{grid-template-columns:repeat(3,1fr);margin-top:0}
+.pollen{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-top:1px solid var(--line);font-size:15px}
+.stats.three + .pollen{margin-top:12px}
 footer{color:var(--muted);font-size:11px;text-align:center;margin-top:18px;line-height:1.7}
 footer a{color:inherit}
 .overlay{position:fixed;inset:0;background:var(--bg);z-index:2000;display:none;overflow:auto;padding:calc(env(safe-area-inset-top) + 12px) 16px calc(env(safe-area-inset-bottom) + 16px)}
@@ -106,6 +119,11 @@ footer a{color:inherit}
     <button class="iconbtn" id="refreshBtn" aria-label="Aktualisieren"><span>↻</span></button>
   </div>
   <div class="chips" id="chips"></div>
+
+  <section class="card" id="warnCard" hidden>
+    <h2>Amtliche Warnungen</h2>
+    <div id="warns"></div>
+  </section>
 
   <section class="card">
     <div class="hero">
@@ -156,9 +174,16 @@ footer a{color:inherit}
     <div id="days"></div>
   </section>
 
+  <section class="card" id="airCard" hidden>
+    <h2>Luft &amp; Pollen heute</h2>
+    <div id="air"></div>
+  </section>
+
   <footer>
     Wetterdaten: <a href="https://open-meteo.com" target="_blank" rel="noopener">Open-Meteo.com</a> (CC BY 4.0)<br>
     Radar: <a href="https://www.dwd.de" target="_blank" rel="noopener">Deutscher Wetterdienst</a> · <a href="https://www.rainviewer.com" target="_blank" rel="noopener">Rain Viewer</a><br>
+    Warnungen: <a href="https://www.dwd.de/warnungen" target="_blank" rel="noopener">Deutscher Wetterdienst</a><br>
+    Luft &amp; Pollen: <a href="https://atmosphere.copernicus.eu" target="_blank" rel="noopener">Copernicus (CAMS)</a> über Open-Meteo<br>
     Karte: <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">© OpenStreetMap-Mitwirkende</a>
   </footer>
 </div>
@@ -240,6 +265,8 @@ async function loadWeather(p) {
   renderHeader();
   centerMap();
   autoRadarSource();
+  loadWarnings(p);
+  loadAir(p);
   const key = keyOf(p);
   const cache = store.get('cache', null);
   if (cache && cache.key === key) render(cache.data, cache.ts);
@@ -370,6 +397,79 @@ function renderDays(d) {
   }).join('');
 }
 
+// ---------- Amtliche Warnungen (DWD, nur Deutschland) ----------
+const SEV = { Minor: [1, '#facc15'], Moderate: [2, '#f97316'], Severe: [3, '#dc2626'], Extreme: [4, '#9333ea'] };
+const sevOf = w => SEV[w.SEVERITY] || [0, '#94a3b8'];
+const fmtWhen = iso => { const d = new Date(iso); return isNaN(d) ? '' : fmtDay(d, 'Europe/Berlin') + ' ' + fmtHM(d, 'Europe/Berlin'); };
+
+async function loadWarnings(p) {
+  const card = $('warnCard');
+  if (!inGermany(p)) { card.hidden = true; return; }
+  const key = keyOf(p);
+  const q = new URLSearchParams({
+    service: 'WFS', version: '2.0.0', request: 'GetFeature', typeNames: 'dwd:Warnungen_Gemeinden', outputFormat: 'application/json',
+    propertyName: 'HEADLINE,DESCRIPTION,SEVERITY,ONSET,EXPIRES,STATUS',
+    CQL_FILTER: `INTERSECTS(THE_GEOM,POINT(${p.lat} ${p.lon}))`   // Achsenfolge: Breite Länge
+  });
+  try {
+    const j = await (await fetch('https://maps.dwd.de/geoserver/dwd/ows?' + q, { cache: 'no-store' })).json();
+    if (keyOf(place) !== key) return;
+    const seen = new Set();
+    const list = (j.features || []).map(f => f.properties)
+      .filter(w => w.STATUS !== 'Test' && !seen.has(w.HEADLINE + w.ONSET) && seen.add(w.HEADLINE + w.ONSET))
+      .sort((a, b) => sevOf(b)[0] - sevOf(a)[0] || new Date(a.ONSET) - new Date(b.ONSET));
+    $('warns').innerHTML = list.length
+      ? list.map(w => `<div class="warn" style="--wc:${sevOf(w)[1]}"><b>${esc(w.HEADLINE)}</b>
+          <small>${esc(fmtWhen(w.ONSET))}${w.EXPIRES ? ' bis ' + esc(fmtWhen(w.EXPIRES)) : ''}</small>
+          ${w.DESCRIPTION ? `<p>${esc(w.DESCRIPTION)}</p>` : ''}</div>`).join('')
+      : '<div class="okline">✅ Keine Warnungen für diesen Ort</div>';
+    card.hidden = false;
+  } catch (e) {
+    card.hidden = true;
+  }
+}
+
+// ---------- Luftqualität & Pollen (Copernicus CAMS über Open-Meteo) ----------
+const AQI = [[20, 'Gut', '#4ade80'], [40, 'Ordentlich', '#a3e635'], [60, 'Mäßig', '#facc15'], [80, 'Schlecht', '#fb923c'], [100, 'Sehr schlecht', '#f87171'], [Infinity, 'Extrem schlecht', '#c084fc']];
+// [Parameter, Name, ab „mittel“, ab „hoch“] in Pollen/m³ (grobe Richtwerte)
+const POLLEN = [['alder_pollen', 'Erle', 10, 100], ['birch_pollen', 'Birke', 10, 100], ['grass_pollen', 'Gräser', 20, 50], ['mugwort_pollen', 'Beifuß', 10, 50], ['ragweed_pollen', 'Ambrosia', 10, 50]];
+const pollenLvl = (v, mid, high) => v == null || v < 1 ? ['keine', ''] : v < mid ? ['gering', '#4ade80'] : v < high ? ['mittel', '#facc15'] : ['hoch', '#f87171'];
+const fmtUg = v => v == null ? '–' : Math.round(v) + ' µg/m³';
+
+async function loadAir(p) {
+  const key = keyOf(p);
+  const q = new URLSearchParams({
+    latitude: p.lat, longitude: p.lon, timezone: 'auto', forecast_days: '1',
+    current: 'european_aqi,pm2_5,pm10,ozone', hourly: POLLEN.map(x => x[0]).join(',')
+  });
+  try {
+    const j = await (await fetch('https://air-quality-api.open-meteo.com/v1/air-quality?' + q)).json();
+    if (keyOf(place) !== key) return;
+    const c = j.current || {}, h = j.hourly || {};
+    let html = '';
+    if (c.european_aqi != null) {
+      const lv = AQI.find(x => c.european_aqi <= x[0]);
+      html += `<div class="aq"><b>${rnd(c.european_aqi)}</b><span class="lvl" style="background:${lv[2]}">${lv[1]}</span><span class="sub">Europäischer Luftqualitätsindex</span></div>
+        <div class="stats three"><div class="stat"><span>Feinstaub 2,5</span><b>${fmtUg(c.pm2_5)}</b></div>
+        <div class="stat"><span>Feinstaub 10</span><b>${fmtUg(c.pm10)}</b></div><div class="stat"><span>Ozon</span><b>${fmtUg(c.ozone)}</b></div></div>`;
+    }
+    const pol = POLLEN.map(([k, name, mid, high]) => {
+      const vals = (h[k] || []).filter(v => v != null);
+      return { name, max: vals.length ? Math.max(...vals) : null, mid, high };
+    });
+    if (pol.some(x => x.max != null)) {
+      html += pol.map(x => {
+        const [txt, col] = pollenLvl(x.max, x.mid, x.high);
+        return `<div class="pollen"><span>${x.name}</span><span class="lvl ${col ? '' : 'none'}"${col ? ` style="background:${col}"` : ''}>${txt}</span></div>`;
+      }).join('');
+    }
+    $('air').innerHTML = html;
+    $('airCard').hidden = !html;
+  } catch (e) {
+    $('airCard').hidden = true;
+  }
+}
+
 // ---------- Karte & Radar ----------
 let map = null, marker = null;
 const radar = { src: store.get('radarSrc', null), frames: [], idx: 0, timer: null, token: 0, userChose: !!store.get('radarSrc', null) };
@@ -416,19 +516,28 @@ function parseDur(p) {
   return m ? ((+m[1] || 0) * 60 + (+m[2] || 0)) * 60000 : 0;
 }
 
+// DWD liefert Radar (Analyse) + Vorhersage bis +2 h; wir starten beim aktuellen Bild
 async function dwdFrames() {
   const res = await fetch('https://maps.dwd.de/geoserver/dwd/Niederschlagsradar/ows?service=WMS&version=1.3.0&request=GetCapabilities', { cache: 'no-store' });
   const doc = new DOMParser().parseFromString(await res.text(), 'text/xml');
-  const dim = [...doc.getElementsByTagName('Dimension')].find(x => (x.getAttribute('name') || '').toLowerCase() === 'time');
+  const dims = [...doc.getElementsByTagName('Dimension')];
+  const dimOf = n => dims.find(x => (x.getAttribute('name') || '').toLowerCase() === n);
+  const dim = dimOf('time'), ref = dimOf('reference_time');
   if (!dim) return [];
   const v = dim.textContent.trim();
+  const STEP = 10 * 60000;                       // 10-Minuten-Schritte
+  let now = ref ? new Date(ref.getAttribute('default')).getTime() : NaN;
+  if (isNaN(now)) now = Date.now();
   let times = [];
   if (v.includes('/')) {
     const [s, e, p] = v.split(',').pop().trim().split('/');
     const end = new Date(e).getTime(), begin = new Date(s).getTime(), step = parseDur(p) || 300000;
-    for (let i = 11; i >= 0; i--) { const t = end - i * step; if (t >= begin) times.push(new Date(t)); }
+    let t = Math.max(begin, Math.floor(now / step) * step);
+    for (; t <= end; t += Math.max(step, STEP)) times.push(new Date(t));
   } else {
-    times = v.split(',').map(x => new Date(x.trim())).filter(x => !isNaN(x)).slice(-12);
+    const all = v.split(',').map(x => new Date(x.trim())).filter(x => !isNaN(x));
+    const i = all.findIndex(x => x.getTime() > now);
+    times = all.slice(i < 0 ? -1 : Math.max(0, i - 1));
   }
   return times.map(t => ({ t, layer: dwdLayer(t.toISOString()) }));
 }
@@ -460,9 +569,9 @@ async function loadRadar() {
   $('slider').max = frames.length - 1;
   $('radarctl').style.display = frames.length > 1 ? '' : 'none';
   $('rnote').textContent = radar.src === 'dwd'
-    ? 'Radarbild vom Deutschen Wetterdienst, alle 5 Minuten neu.'
-    : 'Weltweites Radar (gröbere Auflösung).';
-  showFrame(frames.length - 1);
+    ? 'Deutscher Wetterdienst: aktuelles Radar und Vorhersage für die nächsten 2 Stunden.'
+    : 'Weltweites Radar (gröbere Auflösung, ohne Vorhersage).';
+  showFrame(radar.src === 'dwd' ? 0 : frames.length - 1);
 }
 
 function showFrame(i) {
@@ -470,7 +579,7 @@ function showFrame(i) {
   radar.frames.forEach((f, j) => f.layer.setOpacity(j === i ? 0.75 : 0));
   const f = radar.frames[i];
   $('slider').value = i;
-  $('rtime').textContent = f && f.t ? fmtHM(f.t) : 'aktuell';
+  $('rtime').textContent = radar.src === 'dwd' && i === 0 ? 'Jetzt' : f && f.t ? fmtHM(f.t) : 'aktuell';
 }
 
 function stopAnim() { clearInterval(radar.timer); radar.timer = null; $('play').textContent = '▶'; }
